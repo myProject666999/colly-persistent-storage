@@ -27,6 +27,25 @@ type Storage interface {
 	QueueSize() (int, error)
 }
 
+// AckableStorage is an optional extension of Storage. Backends implementing
+// it keep dequeued requests in a separate "in flight" state until
+// AckRequest is called. The Queue calls GetRequestForAck to dequeue a
+// request and AckRequest after the request has been fully processed
+// (including all of its callbacks).
+//
+// If the process is killed after GetRequestForAck but before AckRequest,
+// the backend is expected to make the request visible again on its next
+// Init, so in-flight requests are not lost.
+type AckableStorage interface {
+	// GetRequestForAck pops the next request from the queue and marks it as
+	// in flight. It returns the serialized request and an opaque id used to
+	// acknowledge it later. An error is returned if the queue is empty.
+	GetRequestForAck() (request []byte, ackID uint64, err error)
+	// AckRequest removes an in-flight request previously returned by
+	// GetRequestForAck.
+	AckRequest(ackID uint64) error
+}
+
 // Queue is a request queue which uses a Collector to consume
 // requests in multiple threads
 type Queue struct {
@@ -36,6 +55,14 @@ type Queue struct {
 	wake    chan struct{}
 	mut     sync.Mutex // guards wake and running
 	running bool
+}
+
+// queuedRequest pairs a dequeued request with the opaque id used to
+// acknowledge it on AckableStorage backends. ackID is zero for backends
+// which do not support explicit acknowledgement.
+type queuedRequest struct {
+	req   *colly.Request
+	ackID uint64
 }
 
 // InMemoryQueueStorage is the default implementation of the Storage interface.
@@ -140,10 +167,10 @@ func (q *Queue) Run(c *colly.Collector) error {
 	q.running = true
 	q.mut.Unlock()
 
-	requestc := make(chan *colly.Request)
+	requestc := make(chan *queuedRequest)
 	complete, errc := make(chan struct{}), make(chan error, 1)
 	for i := 0; i < q.Threads; i++ {
-		go independentRunner(requestc, complete)
+		go independentRunner(q, requestc, complete)
 	}
 	go q.loop(c, requestc, complete, errc)
 	defer close(requestc)
@@ -157,7 +184,7 @@ func (q *Queue) Stop() {
 	q.mut.Unlock()
 }
 
-func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complete <-chan struct{}, errc chan<- error) {
+func (q *Queue) loop(c *colly.Collector, requestc chan<- *queuedRequest, complete <-chan struct{}, errc chan<- error) {
 	var active int
 	for {
 		size, err := q.storage.QueueSize()
@@ -173,9 +200,9 @@ func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complet
 			break
 		}
 		sent := requestc
-		var req *colly.Request
+		var qreq *queuedRequest
 		if size > 0 {
-			req, err = q.loadRequest(c)
+			qreq, err = q.loadRequest(c)
 			if err != nil {
 				// ignore an error returned by GetRequest() or
 				// UnmarshalRequest()
@@ -187,7 +214,7 @@ func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complet
 	Sent:
 		for {
 			select {
-			case sent <- req:
+			case sent <- qreq:
 				active++
 				break Sent
 			case <-q.wake:
@@ -204,21 +231,54 @@ func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complet
 	}
 }
 
-func independentRunner(requestc <-chan *colly.Request, complete chan<- struct{}) {
-	for req := range requestc {
-		req.Do()
+func independentRunner(q *Queue, requestc <-chan *queuedRequest, complete chan<- struct{}) {
+	for qreq := range requestc {
+		qreq.req.Do()
+		// The request, including all its callbacks, has finished. Acknowledge
+		// it so an AckableStorage can drop its in-flight copy. If this
+		// process is killed before this point, the backend re-queues the
+		// request on its next Init.
+		q.ack(qreq.ackID)
 		complete <- struct{}{}
 	}
 }
 
-func (q *Queue) loadRequest(c *colly.Collector) (*colly.Request, error) {
-	buf, err := q.storage.GetRequest()
-	if err != nil {
-		return nil, err
+// ack acknowledges a processed request. It is a no-op for backends which
+// do not implement AckableStorage (ackID stays zero and GetRequest already
+// removed the request).
+func (q *Queue) ack(ackID uint64) {
+	ackable, ok := q.storage.(AckableStorage)
+	if !ok {
+		return
+	}
+	_ = ackable.AckRequest(ackID)
+}
+
+func (q *Queue) loadRequest(c *colly.Collector) (*queuedRequest, error) {
+	var (
+		buf   []byte
+		ackID uint64
+	)
+	if ackable, ok := q.storage.(AckableStorage); ok {
+		var err error
+		buf, ackID, err = ackable.GetRequestForAck()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		var err error
+		buf, err = q.storage.GetRequest()
+		if err != nil {
+			return nil, err
+		}
 	}
 	copied := make([]byte, len(buf))
 	copy(copied, buf)
-	return c.UnmarshalRequest(copied)
+	req, err := c.UnmarshalRequest(copied)
+	if err != nil {
+		return nil, err
+	}
+	return &queuedRequest{req: req, ackID: ackID}, nil
 }
 
 // Init implements Storage.Init() function

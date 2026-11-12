@@ -19,6 +19,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -727,6 +729,29 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	}
 
+	// Incremental re-crawling is only supported by storage backends which
+	// implement IncrementalStorage, and only for GET requests. The request
+	// key is computed from the original request URL; redirects keep the same
+	// key so the freshness record is not fragmented across hop URLs.
+	var (
+		incremental  storage.IncrementalStorage
+		requestKey   string
+		previousMeta storage.ResponseMeta
+	)
+	if inc, ok := c.store.(storage.IncrementalStorage); ok && method == "GET" {
+		incremental = inc
+		requestKey = storage.RequestKey(method, normalizeURL(u), nil)
+		if meta, err := incremental.GetResponseMeta(requestKey); err == nil {
+			previousMeta = meta
+		}
+		if previousMeta.ETag != "" && req.Header.Get("If-None-Match") == "" {
+			req.Header.Set("If-None-Match", previousMeta.ETag)
+		}
+		if previousMeta.LastModified != "" && req.Header.Get("If-Modified-Since") == "" {
+			req.Header.Set("If-Modified-Since", previousMeta.LastModified)
+		}
+	}
+
 	var hTrace *HTTPTrace
 	if c.TraceHTTP {
 		hTrace = &HTTPTrace{}
@@ -749,13 +774,66 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 	if proxyURL, ok := req.Context().Value(ProxyURLKey).(string); ok {
 		request.ProxyURL = proxyURL
 	}
-	if err := c.handleOnError(response, err, request, ctx); err != nil {
-		return err
+	// A 304 Not Modified is a successful conditional revalidation. Go's
+	// transport delivers it without an error, but handleOnError would turn
+	// any 3xx status into one. When we have a stored representation the 304
+	// is handled by the incremental logic below; an unexpected 304 without a
+	// prior record keeps the default error behavior.
+	isRevalidation := incremental != nil && response != nil &&
+		response.StatusCode == http.StatusNotModified &&
+		!previousMeta.FetchedAt.IsZero()
+	if !isRevalidation {
+		if err := c.handleOnError(response, err, request, ctx); err != nil {
+			return err
+		}
 	}
-	c.responseCount.Add(1)
 	response.Ctx = ctx
 	response.Request = request
 	response.Trace = hTrace
+
+	if incremental != nil &&
+		(response.StatusCode == http.StatusOK || response.StatusCode == http.StatusNotModified) {
+		// Decide whether the response carries fresh content. A 304 means the
+		// server confirmed the stored representation is still valid. A 200
+		// whose body hash equals the stored one is treated the same way:
+		// only the metadata is refreshed and content callbacks are skipped.
+		meta := storage.ResponseMeta{
+			FetchedAt:    time.Now(),
+			ETag:         response.Headers.Get("ETag"),
+			LastModified: response.Headers.Get("Last-Modified"),
+			ContentHash:  sha256HexBytes(response.Body),
+		}
+		unchanged := response.StatusCode == http.StatusNotModified &&
+			!previousMeta.FetchedAt.IsZero()
+		if !unchanged && previousMeta.ContentHash != "" &&
+			meta.ContentHash == previousMeta.ContentHash {
+			unchanged = true
+		}
+		if unchanged {
+			// Preserve validators the server omitted on the 304 response and
+			// keep the known body hash (a 304 has no body).
+			if meta.ETag == "" {
+				meta.ETag = previousMeta.ETag
+			}
+			if meta.LastModified == "" {
+				meta.LastModified = previousMeta.LastModified
+			}
+			if meta.ContentHash == "" {
+				meta.ContentHash = previousMeta.ContentHash
+			}
+			if recErr := incremental.RecordResponse(requestKey, meta); recErr != nil {
+				return recErr
+			}
+			// The page did not change: do not run OnResponse, OnHTML, OnXML
+			// or OnScraped for it.
+			return nil
+		}
+		if recErr := incremental.RecordResponse(requestKey, meta); recErr != nil {
+			return recErr
+		}
+	}
+
+	c.responseCount.Add(1)
 
 	err = response.fixCharset(c.DetectCharset, request.ResponseCharacterEncoding)
 	if err != nil {
@@ -803,16 +881,34 @@ func (c *Collector) requestCheck(parsedURL *url.URL, method string, getBody func
 			return nil
 		}
 
-		var body io.ReadCloser
+		var bodyBytes []byte
 		if getBody != nil {
-			var err error
-			body, err = getBody()
+			body, err := getBody()
 			if err != nil {
 				return err
 			}
-			defer body.Close()
+			bodyBytes, err = io.ReadAll(body)
+			body.Close()
+			if err != nil {
+				return err
+			}
 		}
-		uHash := requestHash(u, body)
+		if keyed, ok := c.store.(storage.KeyedStorage); ok {
+			// Keyed backends identify requests by the full method + URL +
+			// body identity instead of a truncated 64-bit hash, so hash
+			// collisions cannot hide unvisited pages.
+			key := storage.RequestKey(method, normalizeURL(u), bodyBytes)
+			visited, err := keyed.IsVisitedKey(key)
+			if err != nil {
+				return err
+			}
+			if visited {
+				return &AlreadyVisitedError{parsedURL}
+			}
+			return keyed.VisitedKey(key)
+		}
+
+		uHash := requestHash(u, bytes.NewReader(bodyBytes))
 		visited, err := c.store.IsVisited(uHash)
 		if err != nil {
 			return err
@@ -1501,28 +1597,56 @@ func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Requ
 		}
 
 		if !c.AllowURLRevisit && !redirectCycle {
-			var body io.ReadCloser
-			if req.GetBody != nil {
-				var err error
-				body, err = req.GetBody()
-				if err != nil {
-					return err
+			// A conditional revalidation (If-None-Match / If-Modified-Since)
+			// is an explicitly allowed re-crawl: hop URLs may still carry
+			// fresh visited records, so the redirect must not be rejected as
+			// "already visited". The freshness decision belongs to the
+			// original request's incremental storage record.
+			conditionalRequest := req.Header.Get("If-None-Match") != "" ||
+				req.Header.Get("If-Modified-Since") != ""
+			if !conditionalRequest {
+				var bodyBytes []byte
+				if req.GetBody != nil {
+					body, err := req.GetBody()
+					if err != nil {
+						return err
+					}
+					bodyBytes, err = io.ReadAll(body)
+					body.Close()
+					if err != nil {
+						return err
+					}
 				}
-				defer body.Close()
-			}
-			uHash := requestHash(req.URL.String(), body)
-			visited, err := c.store.IsVisited(uHash)
-			if err != nil {
-				return err
-			}
-			if visited {
-				if checkRevisit, ok := req.Context().Value(CheckRevisitKey).(bool); !ok || checkRevisit {
-					return &AlreadyVisitedError{req.URL}
+				if keyed, ok := c.store.(storage.KeyedStorage); ok {
+					key := storage.RequestKey(req.Method, normalizeURL(req.URL.String()), bodyBytes)
+					visited, err := keyed.IsVisitedKey(key)
+					if err != nil {
+						return err
+					}
+					if visited {
+						if checkRevisit, ok := req.Context().Value(CheckRevisitKey).(bool); !ok || checkRevisit {
+							return &AlreadyVisitedError{req.URL}
+						}
+					}
+					if err := keyed.VisitedKey(key); err != nil {
+						return err
+					}
+				} else {
+					uHash := requestHash(req.URL.String(), bytes.NewReader(bodyBytes))
+					visited, err := c.store.IsVisited(uHash)
+					if err != nil {
+						return err
+					}
+					if visited {
+						if checkRevisit, ok := req.Context().Value(CheckRevisitKey).(bool); !ok || checkRevisit {
+							return &AlreadyVisitedError{req.URL}
+						}
+					}
+					err = c.store.Visited(uHash)
+					if err != nil {
+						return err
+					}
 				}
-			}
-			err = c.store.Visited(uHash)
-			if err != nil {
-				return err
 			}
 		}
 
@@ -1711,4 +1835,10 @@ func requestHash(url string, body io.Reader) uint64 {
 		io.Copy(h, body)
 	}
 	return h.Sum64()
+}
+
+// sha256HexBytes returns the lowercase hex encoded SHA-256 digest of data.
+func sha256HexBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }

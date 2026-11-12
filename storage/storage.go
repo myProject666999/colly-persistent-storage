@@ -15,11 +15,14 @@
 package storage
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Storage is an interface which handles Collector's internal data,
@@ -125,4 +128,85 @@ func ContainsCookie(cookies []*http.Cookie, name string) bool {
 		}
 	}
 	return false
+}
+
+// KeyedStorage is an optional extension of Storage. Backends implementing it
+// identify requests by their full identity (method, normalized URL and body)
+// instead of the 64-bit FNV-1a hash used by Visited/IsVisited. Because the
+// identity string is not truncated to 64 bits, two distinct requests whose
+// FNV hashes collide cannot make the Collector skip an unvisited page.
+//
+// The Collector calls these methods when the configured Storage implements
+// them and falls back to Visited/IsVisited otherwise, so existing Storage
+// implementations keep working unchanged.
+type KeyedStorage interface {
+	// VisitedKey stores a request identity while the request is in flight.
+	VisitedKey(requestKey string) error
+	// IsVisitedKey reports whether the request identity is already known.
+	IsVisitedKey(requestKey string) (bool, error)
+}
+
+// ResponseMeta stores the freshness metadata of a previously fetched
+// response. It is used by IncrementalStorage backends to decide whether a
+// re-crawl is due and to send conditional requests.
+type ResponseMeta struct {
+	// FetchedAt is the time of the last successful fetch (content changed
+	// or revalidated as unchanged).
+	FetchedAt time.Time
+	// ETag is the entity tag returned by the server (ETag header).
+	ETag string
+	// LastModified is the value of the Last-Modified response header.
+	LastModified string
+	// ContentHash is the hex encoded SHA-256 hash of the response body.
+	ContentHash string
+}
+
+// IncrementalStorage is an optional extension of Storage implemented by
+// backends which support incremental re-crawling. When the Collector's
+// Storage implements it:
+//
+//   - a URL fetched less than the backend's configured expiration duration
+//     ago is skipped without any HTTP request;
+//   - once expired, the URL is re-fetched and the stored ETag /
+//     Last-Modified are sent as If-None-Match / If-Modified-Since headers;
+//   - a 304 response, or a 200 response whose body hash equals the stored
+//     one, only refreshes the stored metadata: OnResponse, OnHTML, OnXML and
+//     OnScraped callbacks are not invoked;
+//   - a 200 response with a changed body is processed normally and the
+//     stored metadata is replaced.
+//
+// All methods must be safe for concurrent use.
+type IncrementalStorage interface {
+	// RevisitInterval returns the duration after which a stored response is
+	// considered stale. A zero or negative duration disables incremental
+	// re-crawling and the backend behaves like a plain visited-set storage.
+	RevisitInterval() time.Duration
+	// GetResponseMeta returns the stored metadata for a request identity
+	// built with RequestKey. A zero ResponseMeta is returned with a nil error
+	// when the identity is not stored.
+	GetResponseMeta(requestKey string) (ResponseMeta, error)
+	// RecordResponse persists the metadata of a completed fetch. It is called
+	// after every successful (2xx) response, including unchanged ones.
+	RecordResponse(requestKey string, meta ResponseMeta) error
+}
+
+// RequestKey builds the full identity string of a request. The key includes
+// the HTTP method, the normalized URL and the exact request body, so POST
+// requests with different bodies and requests whose 64-bit FNV hashes
+// collide remain distinguishable.
+//
+// normalizedURL must be the request URL normalized the same way the
+// Collector normalizes URLs internally; body may be nil.
+func RequestKey(method, normalizedURL string, body []byte) string {
+	var b strings.Builder
+	b.Grow(len(method) + 1 + len(normalizedURL) + 1 + len(body))
+	b.WriteString(method)
+	b.WriteByte(' ')
+	b.WriteString(normalizedURL)
+	if len(body) > 0 {
+		b.WriteByte(' ')
+		sum := sha256.Sum256(body)
+		b.WriteString(hex.EncodeToString(sum[:]))
+	}
+	return b.String()
 }
